@@ -1,17 +1,11 @@
 import tensorflow as tf
-from tensorflow.keras import Sequential
 from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.layers import Input,Conv2D,BatchNormalization,Concatenate,Conv2DTranspose,MaxPooling2D,Activation,Layer,UpSampling2D
-import os
-from scipy.signal import convolve2d
+from tensorflow.keras.layers import Input,Conv2D,Concatenate,UpSampling2D,Conv2DTranspose,Activation,Layer
 import numpy as np
-from glob import glob
-import sklearn
+import os 
 
 
 from focal_loss import BinaryFocalLoss
-
 class SRMFilterLayer(Layer):
     """Custom layer to apply SRM filtering inside the Keras computation graph."""
     def __init__(self, **kwargs):
@@ -129,29 +123,44 @@ def fused_loss(y_true, y_pred, kappa=1.0):
 
 
 
-def encoder(input_shape,encoder_name):
-    encoder_model = tf.keras.applications.DenseNet121(weights="imagenet", include_top=False, input_shape=input_shape)
-    encoder_model._name = encoder_name  
+# def encoder(encoder_input,input_shape,encoder_name,rgb=True):
+#     encoder_model = tf.keras.applications.DenseNet121(weights="imagenet", include_top=False, input_shape=input_shape)
+#     encoder_model._name = encoder_name  
 
-    encoder_model.trainable =False
+#     encoder_model.trainable =False
 
-    inputs = tf.keras.Input(shape=input_shape)
+#     # inputs = tf.keras.Input(shape=input_shape)
 
-    ouput= encoder_model(inputs)
+#     # ouput= encoder_model(inputs)
 
-    s1=encoder_model.get_layer('conv1_relu').output   #output for 4th conct operation
-    s2=encoder_model.get_layer('pool1').output        #output for 3rd conct operation
-    s3=encoder_model.get_layer('pool2_pool').output   #output for 2nd conct operation
-    s4=encoder_model.get_layer('pool3_pool').output   #output for 1st conct operation
-    s5=encoder_model.get_layer('pool4_pool').output   #ouput of encoder
+#     s1=encoder_model.get_layer('conv1_relu').output   #output for 4th conct operation
+#     s2=encoder_model.get_layer('pool1').output        #output for 3rd conct operation
+#     s3=encoder_model.get_layer('pool2_pool').output   #output for 2nd conct operation
+#     s4=encoder_model.get_layer('pool3_pool').output   #output for 1st conct operation
+#     s5=encoder_model.get_layer('pool4_pool').output   #ouput of encoder
 
-    print(s1.shape)
-    print(s2.shape)
-    print(s3.shape)
-    print(s4.shape)
-    print(s5.shape)
+#     print(s1.shape)
+#     print(s2.shape)
+#     print(s3.shape)
+#     print(s4.shape)
+#     print(s5.shape)
 
-    return Model(inputs=inputs, outputs=[s1,s2,s3,s4,s5],name=encoder_name)
+    
+#     return Model(inputs=encoder_input, outputs=[s1,s2,s3,s4,s5],name=encoder_name)
+    
+def encoder(encoder_input, base_model, encoder_name):
+    # Use the shared DenseNet model instead of creating a new one
+    output=base_model(encoder_input)
+
+    s1 = base_model.get_layer('conv1_relu').output
+    s2 = base_model.get_layer('pool1').output
+    s3 = base_model.get_layer('pool2_pool').output
+    s4 = base_model.get_layer('pool3_pool').output
+    s5 = base_model.get_layer('pool4_pool').output
+    
+    return Model(inputs=base_model.input, outputs=[s1, s2, s3, s4, s5], name=encoder_name)(encoder_input)
+
+
 
 
 def conv_block(input,num_filters):# yellow part in decoder
@@ -172,16 +181,12 @@ def decoder_block(input,skip_features,num_filters):# blue part in decoder
     return x
 
 
-def decoder(input_shape, skip_connections, num_filters_list):
-    input_shapes = [tuple(layer.shape[1:]) for layer in skip_connections]  # Extract shapes safely
+def decoder(skip_connections, num_filters_list,rgb_noise_feature): 
 
-    # Create input layers for each skip connection
-    inputs = [Input(shape=shape) for shape in input_shapes]    
-    rgb_noise_input = Input(shape=(256, 256, 3))
-
-    x = inputs[-1]
-    s1,s2,s3,s4,s5=skip_connections   #rgb+noise output
+    s1,s2,s3,s4,s5=skip_connections   # fused features
     
+    x=s5 # input for the decoder i.e output of encoder
+
     x=decoder_block(x,s4,num_filters_list[0])
     x=conv_block(x,num_filters_list[0])
 
@@ -194,7 +199,7 @@ def decoder(input_shape, skip_connections, num_filters_list):
     x=decoder_block(x,s1,num_filters_list[3])
     x=conv_block(x,num_filters_list[3])
 
-    x=decoder_block(x,rgb_noise_input,num_filters_list[4])
+    x=decoder_block(x,rgb_noise_feature,num_filters_list[4])
     x=conv_block(x,num_filters_list[4])
 
     x = Conv2D(filters=1, kernel_size=(1, 1), activation=None)(x)
@@ -202,7 +207,8 @@ def decoder(input_shape, skip_connections, num_filters_list):
 
     print(f"final output of the model=>{output.shape}")
 
-    return Model(inputs=[inputs,rgb_noise_input], outputs=output,name="decoder")
+    # return Model(inputs=input, outputs=output,name="decoder")ou
+    return output
 
 
 def print_shape(string,list):
@@ -211,52 +217,49 @@ def print_shape(string,list):
 
 def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32]):
 
+
+    base_model = tf.keras.applications.DenseNet121(weights="imagenet", include_top=False, input_shape=input_shape)
+    base_model.trainable =False
+
     # RGB Stream Encoder
     rgb_input = Input(shape=input_shape, name="rgb_input")
-    rgb_encoder = encoder(input_shape,"rgb_encoder")
-    rgb_encoder._name = "rgb_encoder"  
-    rgb_features = rgb_encoder(rgb_input)
+    rgb_features = encoder(rgb_input,base_model,"rgb_encoder")  
+    # rgb_features = rgb_encoder(rgb_input)
 
-    print_shape("rgb stream",rgb_features)
+    # print_shape("rgb stream",rgb_features)
 
-    # Noise Stream Encoder with SRM Filtering
     noise_input = Input(shape=input_shape, name="noise_input")
     noise_filtered = SRMFilterLayer()(noise_input)  # Use the custom SRM layer
+    # noise_filtered=noise_input
+    noise_features = encoder(noise_filtered,base_model,"noise_encoder")
+    # noise_features = noise_encoder(noise_filtered)
 
-    noise_encoder = encoder(input_shape,"noise_encoder")
-    noise_encoder._name = "noise_encoder"  
-
-    noise_features = noise_encoder(noise_filtered)
-
-    print_shape("noiose stream",noise_features)
+    # print_shape("noise stream",noise_features)
 
     fused_features=[]
-    for index, layer in enumerate(noise_features):
-        fused_features.append(tf.keras.layers.Add(name=f"fusion{index}")([rgb_features[index], noise_features[index]]))
+    for index, layer in enumerate(zip(rgb_features, noise_features)):  # ✅ Ensures both match
+        fused_features.append(tf.keras.layers.Add(name=f"fusion{index}")([layer[0], layer[1]]))
+
         print(f"Fusion at layer {index}: {fused_features[index].shape}")
 
-    print_shape("fused",fused_features)
+    # print_shape("fused",fused_features)
 
     noise_filtered = Conv2D(3, (1,1), padding="same", activation=None)(noise_filtered) # noise filter should have same channels as rgb image for elemeent wise addition 
-
     rgb_noise = tf.keras.layers.Add()([rgb_input, noise_filtered]) # rgb image and noise additn
 
     decoder_model = decoder(
-    input_shape=fused_features[-1].shape[1:], 
     skip_connections=fused_features, 
     num_filters_list=num_filters_list, 
+    rgb_noise_feature=rgb_noise
     )    
 
-    decoder_output = decoder_model([*fused_features, rgb_noise])
+    # decoder_output = decoder_model(fused_features[-1])
+    decoder_output=decoder_model
 
-    # Model Definition
-    model = Model(inputs=[rgb_input, noise_input], outputs=decoder_output, name="DS_UNet")
-    
-    return model
+    return Model(inputs=[rgb_input, noise_input], outputs=decoder_output, name="DS_UNet")
 
 
-model=DS_UNet()
-model.summary()
-
+DSUNET_model=DS_UNet()
+DSUNET_model.summary()
 
 print("done hai bhaiya ")
