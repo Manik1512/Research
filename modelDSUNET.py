@@ -207,7 +207,6 @@ def decoder(skip_connections, num_filters_list,rgb_noise_feature):
 
     print(f"final output of the model=>{output.shape}")
 
-    # return Model(inputs=input, outputs=output,name="decoder")ou
     return output
 
 
@@ -224,17 +223,14 @@ def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32])
     # RGB Stream Encoder
     rgb_input = Input(shape=input_shape, name="rgb_input")
     rgb_features = encoder(rgb_input,base_model,"rgb_encoder")  
-    # rgb_features = rgb_encoder(rgb_input)
 
-    # print_shape("rgb stream",rgb_features)
+    print_shape("rgb stream",rgb_features)
 
     noise_input = Input(shape=input_shape, name="noise_input")
     noise_filtered = SRMFilterLayer()(noise_input)  # Use the custom SRM layer
-    # noise_filtered=noise_input
     noise_features = encoder(noise_filtered,base_model,"noise_encoder")
-    # noise_features = noise_encoder(noise_filtered)
 
-    # print_shape("noise stream",noise_features)
+    print_shape("noise stream",noise_features)
 
     fused_features=[]
     for index, layer in enumerate(zip(rgb_features, noise_features)):  # ✅ Ensures both match
@@ -242,7 +238,7 @@ def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32])
 
         print(f"Fusion at layer {index}: {fused_features[index].shape}")
 
-    # print_shape("fused",fused_features)
+    print_shape("fused",fused_features)
 
     noise_filtered = Conv2D(3, (1,1), padding="same", activation=None)(noise_filtered) # noise filter should have same channels as rgb image for elemeent wise addition 
     rgb_noise = tf.keras.layers.Add()([rgb_input, noise_filtered]) # rgb image and noise additn
@@ -252,8 +248,6 @@ def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32])
     num_filters_list=num_filters_list, 
     rgb_noise_feature=rgb_noise
     )    
-
-    # decoder_output = decoder_model(fused_features[-1])
     decoder_output=decoder_model
 
     return Model(inputs=[rgb_input, noise_input], outputs=decoder_output, name="DS_UNet")
