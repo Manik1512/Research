@@ -256,4 +256,4 @@ def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32])
 DSUNET_model=DS_UNet()
 DSUNET_model.summary()
 
-print("done hai bhaiya ")
+print("done  ")
