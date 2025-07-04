@@ -3,6 +3,9 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input,Conv2D,Concatenate,UpSampling2D,Conv2DTranspose,Activation,Layer
 import numpy as np
 import os 
+from tensorflow.keras import backend as K
+
+
 
 
 from focal_loss import BinaryFocalLoss
@@ -13,7 +16,8 @@ class SRMFilterLayer(Layer):
         self.kernels = self.create_srm_kernels()
 
     def create_srm_kernels(self):
-        """Convert predefined SRM kernels into TensorFlow filters."""
+        """Convert predefined SRM kernels into TensorFlow filters.
+        We have 3 filter here """    
         srm_kernels = [
             (1/4) * np.array([
                 [0, 0, 0, 0, 0],
@@ -55,16 +59,64 @@ class SRMFilterLayer(Layer):
 
 
 
-class InPlaceABN(Layer):
-    def __init__(self, activation='relu', momentum=0.99, epsilon=1e-3, **kwargs):
+# class InPlaceABN(Layer):
+#     def __init__(self, activation='relu', momentum=0.99, epsilon=1e-3, **kwargs):
 
+#         super(InPlaceABN, self).__init__(**kwargs)
+#         self.momentum = momentum
+#         self.epsilon = epsilon
+#         self.activation = activation
+
+#     def build(self, input_shape):
+#         # Create trainable parameters for batch normalization
+#         self.gamma = self.add_weight(
+#             name='gamma', shape=(input_shape[-1],), initializer='ones', trainable=True
+#         )
+#         self.beta = self.add_weight(
+#             name='beta', shape=(input_shape[-1],), initializer='zeros', trainable=True
+#         )
+#         self.moving_mean = self.add_weight(
+#             name='moving_mean', shape=(input_shape[-1],), initializer='zeros', trainable=False
+#         )
+#         self.moving_variance = self.add_weight(
+#             name='moving_variance', shape=(input_shape[-1],), initializer='ones', trainable=False
+#         )
+#         super(InPlaceABN, self).build(input_shape)
+
+#     def call(self, inputs, training=None):
+#         # Compute batch statistics if in training mode
+#         if training:
+#             batch_mean, batch_var = tf.nn.moments(inputs, axes=[0, 1, 2], keepdims=False)
+#             # Update moving averages
+#             self.moving_mean.assign(self.moving_mean * self.momentum + batch_mean * (1 - self.momentum))
+#             self.moving_variance.assign(self.moving_variance * self.momentum + batch_var * (1 - self.momentum))
+#         else:
+#             # Use moving averages during inference
+#             batch_mean = self.moving_mean
+#             batch_var = self.moving_variance
+
+#         # Apply Batch Normalization
+#         normalized_inputs = (inputs - batch_mean) / tf.sqrt(batch_var + self.epsilon)
+#         bn_output = self.gamma * normalized_inputs + self.beta
+
+
+#         return tf.nn.relu(bn_output)
+
+
+#     def compute_output_shape(self, input_shape):
+#         return input_shape
+
+
+class InPlaceABN(Layer):
+    def __init__(self, activation='leaky_relu', momentum=0.99, epsilon=1e-3, alpha=0.01, **kwargs):
         super(InPlaceABN, self).__init__(**kwargs)
         self.momentum = momentum
         self.epsilon = epsilon
         self.activation = activation
+        self.alpha = alpha  # Slope for Leaky ReLU
 
     def build(self, input_shape):
-        # Create trainable parameters for batch normalization
+        # Trainable scale and shift parameters for Batch Normalization
         self.gamma = self.add_weight(
             name='gamma', shape=(input_shape[-1],), initializer='ones', trainable=True
         )
@@ -80,14 +132,15 @@ class InPlaceABN(Layer):
         super(InPlaceABN, self).build(input_shape)
 
     def call(self, inputs, training=None):
-        # Compute batch statistics if in training mode
         if training:
+            # Compute batch statistics
             batch_mean, batch_var = tf.nn.moments(inputs, axes=[0, 1, 2], keepdims=False)
-            # Update moving averages
+
+            # Update moving averages correctly
             self.moving_mean.assign(self.moving_mean * self.momentum + batch_mean * (1 - self.momentum))
             self.moving_variance.assign(self.moving_variance * self.momentum + batch_var * (1 - self.momentum))
+
         else:
-            # Use moving averages during inference
             batch_mean = self.moving_mean
             batch_var = self.moving_variance
 
@@ -95,12 +148,17 @@ class InPlaceABN(Layer):
         normalized_inputs = (inputs - batch_mean) / tf.sqrt(batch_var + self.epsilon)
         bn_output = self.gamma * normalized_inputs + self.beta
 
-
-        return tf.nn.relu(bn_output)
-
+        # In-Place Activation
+        if self.activation == 'relu':
+            return tf.nn.relu(bn_output)
+        elif self.activation == 'leaky_relu':
+            return tf.nn.leaky_relu(bn_output, alpha=self.alpha)
+        else:
+            raise ValueError("Unsupported activation. Use 'relu' or 'leaky_relu'.")
 
     def compute_output_shape(self, input_shape):
         return input_shape
+
 
 
 def dice_loss(y_true, y_pred, epsilon=1e-7):
@@ -226,8 +284,8 @@ def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32])
 
     print_shape("rgb stream",rgb_features)
 
-    noise_input = Input(shape=input_shape, name="noise_input")
-    noise_filtered = SRMFilterLayer()(noise_input)  # Use the custom SRM layer
+    #noise_input = Input(shape=input_shape, name="noise_input")
+    noise_filtered = SRMFilterLayer()(rgb_input)  # Use the custom SRM layer
     noise_features = encoder(noise_filtered,base_model,"noise_encoder")
 
     print_shape("noise stream",noise_features)
@@ -250,10 +308,14 @@ def DS_UNet(input_shape=(256, 256, 3), num_filters_list=[256, 512, 256, 64, 32])
     )    
     decoder_output=decoder_model
 
-    return Model(inputs=[rgb_input, noise_input], outputs=decoder_output, name="DS_UNet")
+    # return Model(inputs=[rgb_input, noise_input], outputs=decoder_output, name="DS_UNet")
+    return Model(inputs=rgb_input, outputs=decoder_output, name="DS_UNet")
+
 
 
 DSUNET_model=DS_UNet()
-DSUNET_model.summary()
+# DSUNET_model.summary()
+from tensorflow.keras.utils import plot_model
+plot_model(DSUNET_model, to_file='model.png', show_shapes=True, show_layer_names=True)
 
 print("done hai ")
