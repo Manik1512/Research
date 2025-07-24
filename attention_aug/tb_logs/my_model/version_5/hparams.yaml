@@ -1,0 +1,4 @@
+attention_heads: 4
+batch_size: 16
+lambda_reg: 1
+threshold: 0.5

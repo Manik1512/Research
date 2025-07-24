@@ -1,9 +1,9 @@
 import torch
 import torch.nn.functional as F
 import pytorch_lightning as pl
+import torch.nn as nn
 
-
-class attention_augment:
+class attention_augment(nn.Module):
     def __init__(self,batch_size, attention_heads,threshld):
         super().__init__()
         self.B= batch_size
