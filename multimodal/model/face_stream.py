@@ -1,21 +1,30 @@
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 import torch.nn as nn 
 import torch
+from torch.amp import autocast
 import math
-import torch.functional as F
+import torch.nn.functional as F
 from einops import rearrange, repeat
-from timm.models.layers import  to_2tuple, trunc_normal_
-from timm.models.layers import DropPath
-from timm.models.vision_transformer import MLP, PatchEmbed
+from timm.layers import  to_2tuple, trunc_normal_
+from timm.layers import DropPath
+# from timm.models.vision_transformer import MLP, PatchEmbed
+import pytorch_lightning as pl
+# from timm.layers import mlp,patch_embed
+from timm.layers.mlp import Mlp
 
-class MambaVisionMixer(nn.Module):
+#checked
+class MambaVisionMixer(nn.Module):  #its mamba block 
+    """
+    hidden_states: (B, L, D)
+    Returns: same shape as hidden_states
+    """
     def __init__(
         self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
+        d_model, #The input and output dimensionality of the hidden states.
+        d_state=16,  #hinnden state dimensionality, used for the selective scan (h ki dimension)
+        d_conv=3,
+        expand=2,  # d_innner = expand * d_model (ssm kai formula mai x ki dimension d_inner hai)
+        dt_rank="auto", # dt is learnable time step 
         dt_min=0.001,
         dt_max=0.1,
         dt_init="random",
@@ -122,9 +131,19 @@ class MambaVisionMixer(nn.Module):
 
 
 
-
-class Attention(nn.Module):
-
+#checked
+class Attention(nn.Module):  #it performs multi head self attention
+    """args:
+        dim: input dimension
+        num_heads: number of attention heads
+        qkv_bias: if True, adds a learnable bias to query, key, value projections
+        qk_norm: if True, normalizes the query and key before the attention
+        attn_drop: dropout rate for attention weights
+        proj_drop: dropout rate for the output projection
+        norm_layer: normalization layer to apply to the query and key
+        x: input tensor of shape (B, N, C) 
+        output: output tensor of shape (B, N, C)
+        """
     def __init__(
             self,
             dim,
@@ -158,10 +177,15 @@ class Attention(nn.Module):
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.fused_attn:
-            x = F.scaled_dot_product_attention(
+            x = F.scaled_dot_product_attention(    #instead of manually computing attention, we use PyTorch's built-in function
              q, k, v,
                 dropout_p=self.attn_drop.p,
             )
+
+
+            """dropout_p=self.attn_drop.p, ::: IN the softmax score for each token 
+                it randomly drops out some of the wieghts so that model doesnt rely on a particyular patch 
+                during training , it reduces overfitting"""
         else:
             q = q * self.scale
             attn = q @ k.transpose(-2, -1)
@@ -176,49 +200,42 @@ class Attention(nn.Module):
 
 
 
-
-class PatchEmbed(nn.Module):
-    """ Image to Patch Embedding
-    """
-    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, num_frames=16, tubelet_size=2):
+#checked
+class PatchEmbed(nn.Module): 
+    """input: B,T,C,H,W
+       output: B*T, N, D"""
+    def __init__(self,patch_dim,patch_size,num_frames,H_img,W_img,input_channels=3):
         super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
-        self.tubelet_size = int(tubelet_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0]) * (num_frames // self.tubelet_size)
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-        self.proj = nn.Conv3d(in_channels=in_chans, out_channels=embed_dim, 
-                            kernel_size=(self.tubelet_size, patch_size[0], patch_size[1]), 
-                            stride=(self.tubelet_size, patch_size[0], patch_size[1]))
+        self.conv=nn.Conv2d(
+            in_channels=input_channels,
+            out_channels=patch_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            padding=0)
 
-    def forward(self, x, **kwargs):
-        B, C, T, H, W = x.shape
-        # FIXME look at relaxing size constraints
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj(x).flatten(2).transpose(1, 2)
-        return x
-    
+        
+        H_patches = int(H_img // patch_size)
+        W_patches = int(W_img // patch_size)
+        self.spatial_pos = nn.Parameter(torch.randn(1, 1, patch_dim, H_patches, W_patches))  # broadcasted over B, T
+        self.temporal_pos = nn.Parameter(torch.randn(1, num_frames, patch_dim, 1, 1))   
 
+        nn.init.trunc_normal_(self.temporal_pos, std=0.02)
+        nn.init.trunc_normal_(self.spatial_pos, std=0.02)
 
+    def forward(self,x):
+        b,t,_,_,_= x.shape
+        x=rearrange(x,"b t c h w -> (b t) c h w")  # (B*T, C, H, W)
+        patches=self.conv(x)
+        patches=rearrange(patches,'(b t) c h w -> b t c h w', b=b,t=t)  # (B*T, C, H, W) -> (B, T, C, H, W)
 
+        patches=patches+ self.temporal_pos +self.spatial_pos # Adding temporal positional encoding
 
-
-class stageBlock(nn.Module):
-    def __init__(self, num_layers, dim):
-        """Expects input in the form (B,L,D)"""
-        super().__init__()
-        self.blocks = nn.Sequential(
-            *[MambaAttnBlock(dim, use_mamba=True) for _ in range(num_layers)],
-            *[MambaAttnBlock(dim, use_attn=True) for _ in range(num_layers)]
-        )
-
-    def forward(self, x):
-        return self.blocks(x)
+        patches=rearrange(patches,"b t c h w-> (b t) (h w) c")  # (B*T, N, D)
+        return patches
 
 
+
+#checked
 def window_partition(x, window_size):
     """
     Args:
@@ -235,32 +252,30 @@ def window_partition(x, window_size):
     return windows  
 
 
-
+#checked
 class MambaAttnBlock(nn.Module):
     """Performs either Mamba or Attention based on the flags provided.
          take x: (B, L, D) 
          returns x: (B, L, D)
-    
+
     """
 
-    def __init__(self, dim, H,W,use_mamba=False, use_attn=False,layer_scale=None,drop_path=0.0):
+    def __init__(self, dim, use_mamba=False, use_attn=False,layer_scale=None,drop_path=0.0,window_size=7):
         super().__init__()
-        self.H= H
-        self.W = W
         self.use_mamba = use_mamba
         self.use_attn = use_attn
-
+        self.window_size = window_size
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
         if use_mamba:
             self.mamba = MambaVisionMixer(d_model=dim)
         elif use_attn:
-            self.attn = Attention(dim=dim)
+            self.attn = Attention(dim=dim,num_heads=4)
         else:
             raise ValueError("Either use_mamba or use_attn must be True")
 
-        self.mlp = MLP(in_features=dim, hidden_features=dim * 4, drop=0.0)
+        self.mlp = Mlp(in_features=dim, hidden_features=dim * 4, drop=0.0)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
 
@@ -271,23 +286,69 @@ class MambaAttnBlock(nn.Module):
         
 
     def forward(self, x):
-        if self.use_mamba:
-            x = x + self.mamba(self.norm1(x))
-            x = x + self.mlp(self.norm1(x))
+        # if self.use_mamba:
+        #     x = x + self.mamba(self.norm1(x))
+        #     x = x + self.mlp(self.norm1(x))
 
         if self.use_attn:
             B, N, C = x.shape
-            x_img = x.transpose(1, 2).reshape(B, C, self.H, self.W) # Convert from token format (B, N, C) to image shape (B, C, H, W)
-            x_win = window_partition(x_img, window_size=7)
+            H= int(N**0.5)  # Assuming N is a perfect square for simplicity
+            W=H
+            x_img = x.transpose(1, 2).reshape(B, C, H, W) # Convert from token format (B, N, C) to image shape (B, C, H, W)
+            x_win = window_partition(x_img, window_size=self.window_size) #ouputxs (num_windows*B, window_size*window_size, C)
             x_attent= self.attn(x_win)
-            x_img = x_img + self.drop_path(self.gamma_1 * window_reverse(x_attent, 7, self.H, self.W))
+            x_img = x_img + self.drop_path(self.gamma_1 * window_reverse(x_attent, window_size=self.window_size, H=H, W=W))
             x = x_img.flatten(2).transpose(1, 2)  #Convert back to (B, N, C) format
 
+        else:
+            x = x + self.drop_path(self.gamma_1 * self.mamba(self.norm1(x)))
+
+        return x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
+
+
+
+
+#checked
+class Downsample(nn.Module):
+    """
+    Down-sampling block"
+    input: (B , L , D)
+    output: (B , L/4 , 2D) , its equivalent to (B,H/2,W/2,2D)
+    """
+
+    def __init__(self,
+                 dim,
+                 keep_dim=False,
+                 ):
+        """
+        Args:
+            dim: feature size dimension.
+            norm_layer: normalization layer.
+            keep_dim: bool argument for maintaining the resolution.
+        """
+
+        super().__init__()
+        if keep_dim:
+            dim_out = dim
+        else:
+            dim_out = 2 * dim
+
+        
+        self.reduction = nn.Sequential(
+            nn.Conv2d(dim, dim_out, 3, 2, 1, bias=False),
+        )
+
+    def forward(self, x):
+        H_new=int(pow(x.shape[1],0.5))
+        W_new=H_new
+        x=rearrange(x,"b (h w) d -> b d h w ",h=H_new,w=W_new)  # (B, N, C) -> (B, C, H, W)
+        x = self.reduction(x)
+        x=rearrange(x ," b d h w -> b (h w) d ")
         return x
 
 
-
-def window_reverse(windows, window_size, H, W):
+#checked
+def window_reverse(windows, window_size, H, W): 
     """
     Args:
         windows: local window features (num_windows*B, window_size, window_size, C)
@@ -301,3 +362,78 @@ def window_reverse(windows, window_size, H, W):
     x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
     x = x.permute(0, 5, 1, 3, 2, 4).reshape(B,windows.shape[2], H, W)
     return x
+
+
+
+#checked
+class stageBlock(nn.Module):  #Hybrid mamba transformer block
+    def __init__(self, num_layers, dim,window_size=7):
+        """Expects input in the form (B,L,D)"""
+        super().__init__()
+        self.blocks = nn.Sequential(
+            *[MambaAttnBlock(dim, use_mamba=True,window_size=window_size) for _ in range(num_layers)],
+            *[MambaAttnBlock(dim, use_attn=True,window_size=window_size) for _ in range(num_layers)]
+        )
+
+    def forward(self, x):
+        return self.blocks(x)
+
+
+class model(pl.LightningDataModule):
+    """
+    input:(B,T,C,H,W)
+    """
+    def __init__(
+        self,
+        pretrain,
+        patch_size,
+        patch_dim,
+        num_frames,
+        H_img,
+        W_img,
+        num_layers,
+        window_size):
+
+        self.patch_dim = patch_dim
+        self.patch_size = patch_size
+        self.num_frames = num_frames
+        self.H_img = H_img
+        self.W_img = W_img
+        self.num_layers = num_layers
+        self.window_size = window_size
+        
+      
+        super().__init__()
+        self.pretrain=pretrain
+        # self.patchify=
+        pass
+    def forward(self,x):
+        B,T,C,H,W = x.shape
+        if self.pretrain:
+            pass
+        else:
+            pass
+
+
+
+if __name__=="__main__":
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    x = torch.randn(4, 25, 3, 224, 224).to(device)
+
+    patching = PatchEmbed(patch_dim=96, patch_size=4, num_frames=25, H_img=224, W_img=224).to(device)
+    stage = stageBlock(num_layers=2, dim=96, window_size=7).to(device)
+    down = Downsample(dim=96, keep_dim=False).to(device)
+
+    # Automatic Mixed Precision context
+    with autocast(device_type="cuda",dtype=torch.float16):
+        patches = patching(x)
+        print(patches.shape)
+
+        out = stage(patches)
+        print(out.shape)
+
+        out = down(out)
+        print(out.shape)
+
+
