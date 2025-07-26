@@ -152,7 +152,7 @@ class Attention(nn.Module):  #it performs multi head self attention
             qk_norm=False,
             attn_drop=0.,
             proj_drop=0.,
-            norm_layer=nn.LayerNorm,
+            norm_layer=nn.LayerNorm
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -198,6 +198,50 @@ class Attention(nn.Module):  #it performs multi head self attention
         x = self.proj_drop(x)
         return x
 
+
+
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, dim, max_frames=32, num_heads=4):
+        super().__init__()
+        self.max_frames = max_frames
+        self.dim = dim
+        self.num_heads = num_heads
+
+        self.kv_proj = nn.Linear(dim, dim * 2)  # for keys and values
+        self.q_tokens = nn.Parameter(torch.randn(1, max_frames, dim))  # one learnable query per frame
+
+        # MultiheadAttention (expects input as (B, N, D) when batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, batch_first=True)
+
+    def forward(self, x):
+        """
+        x: (B*T, N, D) — spatial tokens from each frame
+        T: number of frames
+        Output: (B, T, D) — summary per frame
+        """
+        BxT, N, D = x.shape
+        B = BxT // self.max_frames
+
+        # Project keys and values
+        kv = self.kv_proj(x)          # (B*T, N, 2*D)
+        k, v = kv.chunk(2, dim=-1)    # (B*T, N, D), (B*T, N, D)
+
+        # Prepare frame-level queries
+        q = self.q_tokens[:, :self.max_frames, :].expand(B, self.max_frames, D)  # (B, T, D)
+
+        # Reshape everything to (B*T, ..., D) for attention
+        q = rearrange(q, 'b t d -> (b t) 1 d')        # (B*T, 1, D)
+        k = rearrange(k, '(b t) n d -> (b t) n d', b=B, t=self.max_frames)
+        v = rearrange(v, '(b t) n d -> (b t) n d', b=B, t=self.max_frames)
+
+        # Multihead attention: output (B*T, 1, D)
+        out, _ = self.cross_attn(q, k, v)             # (B*T, 1, D)
+
+        # Final reshape: (B, T, D)
+        out = rearrange(out, '(b t) 1 d -> b t d', b=B, t=self.max_frames)
+        return out
 
 
 #checked
@@ -260,7 +304,7 @@ class MambaAttnBlock(nn.Module):
 
     """
 
-    def __init__(self, dim, use_mamba=False, use_attn=False,layer_scale=None,drop_path=0.0,window_size=7):
+    def __init__(self, dim, use_mamba=False, use_attn=False,layer_scale=None,drop_path=0.0,window_size=7,temporal=False):
         super().__init__()
         self.use_mamba = use_mamba
         self.use_attn = use_attn
@@ -283,7 +327,7 @@ class MambaAttnBlock(nn.Module):
 
         self.gamma_1 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
         self.gamma_2 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
-        
+        self.temporal = temporal  # Whether to use temporal attention or not
 
     def forward(self, x):
         # if self.use_mamba:
@@ -291,14 +335,17 @@ class MambaAttnBlock(nn.Module):
         #     x = x + self.mlp(self.norm1(x))
 
         if self.use_attn:
-            B, N, C = x.shape
-            H= int(N**0.5)  # Assuming N is a perfect square for simplicity
-            W=H
-            x_img = x.transpose(1, 2).reshape(B, C, H, W) # Convert from token format (B, N, C) to image shape (B, C, H, W)
-            x_win = window_partition(x_img, window_size=self.window_size) #ouputxs (num_windows*B, window_size*window_size, C)
-            x_attent= self.attn(x_win)
-            x_img = x_img + self.drop_path(self.gamma_1 * window_reverse(x_attent, window_size=self.window_size, H=H, W=W))
-            x = x_img.flatten(2).transpose(1, 2)  #Convert back to (B, N, C) format
+            if self.temporal:
+                x=self.attn(self.norm1(x))  # Apply attention directly
+            else:
+                B, N, C = x.shape
+                H= int(N**0.5)  # Assuming N is a perfect square for simplicity
+                W=H
+                x_img = x.transpose(1, 2).reshape(B, C, H, W) # Convert from token format (B, N, C) to image shape (B, C, H, W)
+                x_win = window_partition(x_img, window_size=self.window_size) #ouputxs (num_windows*B, window_size*window_size, C)
+                x_attent= self.attn(x_win)
+                x_img = x_img + self.drop_path(self.gamma_1 * window_reverse(x_attent, window_size=self.window_size, H=H, W=W))
+                x = x_img.flatten(2).transpose(1, 2)  #Convert back to (B, N, C) format
 
         else:
             x = x + self.drop_path(self.gamma_1 * self.mamba(self.norm1(x)))
@@ -319,6 +366,7 @@ class Downsample(nn.Module):
     def __init__(self,
                  dim,
                  keep_dim=False,
+                 depth_wise=False
                  ):
         """
         Args:
@@ -333,9 +381,21 @@ class Downsample(nn.Module):
         else:
             dim_out = 2 * dim
 
-        
-        self.reduction = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, 2, 1, bias=False),
+        if depth_wise:
+            self.reduction=nn.Sequential(
+                nn.Conv2d(
+                dim, dim, kernel_size=3, stride=2, padding=1, groups=dim),
+                nn.BatchNorm2d(dim),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(dim, dim_out, kernel_size=1),
+                nn.BatchNorm2d(dim_out),
+                nn.ReLU(inplace=True)
+
+            )
+
+        else:
+            self.reduction = nn.Sequential(
+                nn.Conv2d(dim, dim_out, 3, 2, 1, bias=False),
         )
 
     def forward(self, x):
@@ -367,19 +427,19 @@ def window_reverse(windows, window_size, H, W):
 
 #checked
 class stageBlock(nn.Module):  #Hybrid mamba transformer block
-    def __init__(self, num_layers, dim,window_size=7):
+    def __init__(self, num_layers, dim,window_size=7,temporal=False):
         """Expects input in the form (B,L,D)"""
         super().__init__()
         self.blocks = nn.Sequential(
-            *[MambaAttnBlock(dim, use_mamba=True,window_size=window_size) for _ in range(num_layers)],
-            *[MambaAttnBlock(dim, use_attn=True,window_size=window_size) for _ in range(num_layers)]
+            *[MambaAttnBlock(dim, use_mamba=True,window_size=window_size,temporal=temporal) for _ in range(num_layers)],
+            *[MambaAttnBlock(dim, use_attn=True,window_size=window_size,temporal=temporal) for _ in range(num_layers)]
         )
 
     def forward(self, x):
         return self.blocks(x)
 
 
-class model(pl.LightningDataModule):
+class MY_model(nn.Module):
     """
     input:(B,T,C,H,W)
     """
@@ -392,8 +452,9 @@ class model(pl.LightningDataModule):
         H_img,
         W_img,
         num_layers,
-        window_size):
-
+        window_size
+        ):
+        super().__init__()
         self.patch_dim = patch_dim
         self.patch_size = patch_size
         self.num_frames = num_frames
@@ -403,37 +464,99 @@ class model(pl.LightningDataModule):
         self.window_size = window_size
         
       
-        super().__init__()
+        self.stage1=stageBlock(num_layers=2,dim=patch_dim,window_size=window_size)
+        self.stage2=stageBlock(num_layers=2,dim=patch_dim*2,window_size=window_size)
+        self.stage3=stageBlock(num_layers=2,dim=patch_dim*4,window_size=window_size,temporal=True)
+        self.stage4=stageBlock(num_layers=2,dim=patch_dim*8,window_size=window_size,temporal=True)
+
+        self.down1=Downsample(dim=patch_dim,depth_wise=True,keep_dim=False)
+        self.down2=Downsample(dim=patch_dim*2,depth_wise=True,keep_dim=False)
+        self.down3=nn.Linear(patch_dim*4,patch_dim*8)  # linear bcoz, here we have input as( B,T,C) and output as (B,T,C)
+
+        self.patching = PatchEmbed(patch_dim=patch_dim, patch_size=patch_size, num_frames=num_frames, H_img=H_img, W_img=W_img)
+
+
+
+        self.cross_attention = CrossAttention(dim=patch_dim*4, max_frames=num_frames, num_heads=2)
         self.pretrain=pretrain
-        # self.patchify=
-        pass
+
+        self.classifier=nn.Linear(patch_dim*8, 1)  # Assuming 1000 classes for classification, change as needed
+        
+        # self.channel_pool
+        # pass
     def forward(self,x):
         B,T,C,H,W = x.shape
         if self.pretrain:
             pass
         else:
-            pass
+            patches=self.patching(x)  # (B*T, N, D)
+
+        x1= self.stage1(patches)  # (B*T, N, D)
+        x1=self.down1(x1)  # (B*T, N/4, 2D)
+        x2= self.stage2(x1)  # (B*T, N/4, 2D)
+        x2=self.down2(x2)  # (B*T, N/16, 4D)
+
+        x2= self.cross_attention(x2)
+        x3= self.stage3(x2)  # (B*T, N/16, 4D)
+        x3=self.down3(x3)  # (B*T, N/64, 8D)
+        x4= self.stage4(x3)  # (B*T, N/64, 8D)
+
+        x4=x4.mean(dim=1)
+        logits=self.classifier(x4)  # (B*T, 1)
+        out=nn.Sigmoid()(logits)  # (B*T, 1)
+        return out  # (B*T, N/64, 8D)
+
 
 
 
 if __name__=="__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    x = torch.randn(4, 25, 3, 224, 224).to(device)
+    
 
-    patching = PatchEmbed(patch_dim=96, patch_size=4, num_frames=25, H_img=224, W_img=224).to(device)
-    stage = stageBlock(num_layers=2, dim=96, window_size=7).to(device)
-    down = Downsample(dim=96, keep_dim=False).to(device)
+    # patching = PatchEmbed(patch_dim=96, patch_size=4, num_frames=25, H_img=224, W_img=224).to(device)
+    # stage = stageBlock(num_layers=2, dim=96, window_size=7).to(device)
+    # down = Downsample(dim=96, keep_dim=False,depth_wise=True).to(device)
+    # cross_attention = CrossAttention(dim=192, max_frames=25, num_heads=4).to(device)
+
+
+  
 
     # Automatic Mixed Precision context
     with autocast(device_type="cuda",dtype=torch.float16):
-        patches = patching(x)
-        print(patches.shape)
+       
+        # patches = patching(x)
+        # print(patches.shape)
 
-        out = stage(patches)
+        # out = stage(patches)
+        # print(out.shape)
+
+
+        x = torch.randn(11, 25, 3, 112, 112).to(device)
+        model=MY_model(
+        pretrain=False,
+        patch_size=4,
+        patch_dim=96,
+        num_frames=25,
+        H_img=x.shape[3],
+        W_img=x.shape[4],
+        num_layers=2,
+        window_size=7
+        ).to(device)
+        
+        # out = down(out)
+        # print(out.shape)
+        starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        starter.record()
+        # out= cross_attention(out)
+        out=model(x)  
         print(out.shape)
 
-        out = down(out)
-        print(out.shape)
+
+        # print(out.shape)
+        ender.record()
+        torch.cuda.synchronize()  # Wait for kernel to finish
+        print(f"Time taken: {starter.elapsed_time(ender):.3f} ms") 
 
 
